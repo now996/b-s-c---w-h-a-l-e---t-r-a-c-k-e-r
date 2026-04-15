@@ -1,0 +1,31 @@
+# 运行时数据
+data/
+logs/
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+
+# 配置（含密钥，不上传）
+config.json
+config.json.bak*
+
+# 备份文件
+*.bak
+*.bak.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 虚拟环境
+venv/
+.env

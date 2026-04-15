@@ -1,0 +1,59 @@
+{
+  "alchemy_key": "YOUR_ALCHEMY_BSC_KEY",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "contracts": {
+    "0xYOUR_CONTRACT_ADDRESS": {
+      "name": "TokenName",
+      "pair": "0xYOUR_PANCAKE_PAIR_ADDRESS",
+      "whale_addrs": [
+        "0xWHALE_ADDRESS_1",
+        "0xWHALE_ADDRESS_2"
+      ],
+      "watched_wallets": [
+        "0xWATCH_ADDR_1",
+        "0xWATCH_ADDR_2"
+      ],
+      "watched_labels": {
+        "0xWATCH_ADDR_1": "活跃出货A",
+        "0xWATCH_ADDR_2": "分仓停放A"
+      },
+      "priority_core_addresses": {
+        "0xCORE_ENTRY": "总中转入口"
+      },
+      "alert_threshold_usd": 500
+    }
+  },
+  "poll_interval": 30,
+  "monitor_mode": "ws",
+  "wss_endpoints": [
+    "wss://bnb-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY"
+  ],
+  "bsc_rpc": "https://bsc-rpc.publicnode.com",
+  "bsc_rpcs": [
+    "https://bsc-rpc.publicnode.com",
+    "https://bsc.drpc.org",
+    "https://rpc.ankr.com/bsc"
+  ],
+  "data_source": {
+    "history": {
+      "primary": "alchemy_transfers",
+      "fallback": "eth_getlogs",
+      "alchemy_page_size": 1000,
+      "alchemy_sleep_between_pages": 0.2,
+      "alchemy_threshold": 50000
+    },
+    "price": {
+      "primary": "dexscreener",
+      "fallback": "geckoterminal"
+    }
+  },
+  "notify": {
+    "webhook_url": "",
+    "webhook_type": "dingtalk"
+  },
+  "db": {
+    "cleanup_days": 30,
+    "keep_whale_records_days": 90
+  }
+}
