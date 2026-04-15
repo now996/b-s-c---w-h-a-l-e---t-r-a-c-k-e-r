@@ -11,7 +11,8 @@ from collections import defaultdict
 
 ALCHEMY_KEY = os.environ.get("ALCHEMY_KEY", "")
 def _get_alchemy_url():
-    return f"https://bnb-mainnet.g.alchemy.com/v2/{os.environ.get("ALCHEMY_KEY", ALCHEMY_KEY)}"
+    key = os.environ.get("ALCHEMY_KEY", ALCHEMY_KEY)
+    return f"https://bnb-mainnet.g.alchemy.com/v2/{key}"
 
 
 def get_addr_tokens(addr, direction="from", max_pages=3):
