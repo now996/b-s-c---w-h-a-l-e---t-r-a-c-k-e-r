@@ -10,9 +10,13 @@ from datetime import datetime, timezone
 
 # 统一数据源层
 from data_source import AlchemyClient, PriceProvider, RPCClient, get_alchemy_client, get_price_provider, get_rpc_client
+from data_source import DEX_ROUTERS as _DEX_ROUTERS_SRC
 
 ZERO = "0x0000000000000000000000000000000000000000"
 DEAD = "0x000000000000000000000000000000000000dead"
+
+# BSC DEX 路由器合约（买入/卖出不一定直接经过 LP，可能经过路由器中转）
+DEX_ROUTERS = set(_DEX_ROUTERS_SRC)  # 从 data_source 统一导入
 DEFAULT_RPCS = [
     "https://bsc-rpc.publicnode.com",
     "https://bsc.drpc.org",
@@ -202,7 +206,7 @@ def get_token_info(contract):
     pair = v2_pair or (pools[0][0] if pools else None)
 
     return {
-        "name": name, "symbol": symbol, "decimals": decimals,
+        "contract": contract, "name": name, "symbol": symbol, "decimals": decimals,
         "total_supply": total_supply, "owner": owner,
         "pair": pair, "pools": pools,
     }
@@ -861,6 +865,7 @@ def identify_whales(records, pools_info, total_supply, top_n=10):
     else:
         pool_set = {p[0].lower() for p in pools_info}
     exclude = {ZERO, DEAD} | pool_set
+    dex_set = pool_set | {r.lower() for r in DEX_ROUTERS}
     buyers = defaultdict(float)
     balances = defaultdict(float)
     transfer_graph = defaultdict(lambda: defaultdict(float))
@@ -868,7 +873,8 @@ def identify_whales(records, pools_info, total_supply, top_n=10):
     for block, fa, ta, amount in records:
         balances[fa] -= amount
         balances[ta] += amount
-        if fa in pool_set:
+        if fa in dex_set:
+            # 从 LP 或路由器转入 = 买入
             buyers[ta] += amount
         elif fa == ZERO:
             # mint 事件（from=0x0）：to_addr 正常累加到 transfer_graph
@@ -1044,6 +1050,29 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
         addr_records[fa].append(i)
         addr_records[ta].append(i)
 
+    # 构建 DEX 交互地址集合：pool_set + 已知路由器 + 自动发现的高频LP交互合约
+    dex_set = pool_set | {r.lower() for r in DEX_ROUTERS}
+
+    # 自动发现：从 DB 中找出与 LP 高频交互的合约（>=10次交互且不是已知庄家）
+    # 这些大概率是路由器/管理合约，应该纳入买卖检测
+    try:
+        for p in pool_set:
+            # 与 LP 交互 >=10 次的地址
+            rows = conn.execute(
+                "SELECT from_addr FROM transfers WHERE to_addr=? GROUP BY from_addr HAVING COUNT(*)>=10",
+                (p,)
+            ).fetchall()
+            for row in rows:
+                dex_set.add(row[0].lower())
+            rows = conn.execute(
+                "SELECT to_addr FROM transfers WHERE from_addr=? GROUP BY to_addr HAVING COUNT(*)>=10",
+                (p,)
+            ).fetchall()
+            for row in rows:
+                dex_set.add(row[0].lower())
+    except Exception:
+        pass
+
     # 庄家成本分析（使用倒排索引，O(N) 而非 O(W×N)）
     whale_results = []
     for addr in whale_addrs:
@@ -1059,12 +1088,14 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
                 continue
             seen.add(i)
             block, fa, ta, amount = records[i]
-            if fa in pool_set and ta == addr:
+            # 买入：从 LP 或路由器转入
+            if fa in dex_set and ta == addr:
                 price = block_to_price(block)
                 total_buy_cost += amount * price
                 total_buy_amount += amount
                 buy_cnt += 1
-            elif fa == addr and ta in pool_set:
+            # 卖出：转给 LP 或路由器
+            elif fa == addr and ta in dex_set:
                 price = block_to_price(block)
                 total_sell_revenue += amount * price
                 total_sell_amount += amount

@@ -19,6 +19,21 @@ ZERO = "0x0000000000000000000000000000000000000000"
 DEAD = "0x000000000000000000000000000000000000dead"
 WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 
+# BSC DEX 路由器合约（买卖不一定直接经过 LP，可能经过路由器中转）
+# 注意：此列表不完整，scan_core 会自动从 DB 中发现与 LP 高频交互的合约
+DEX_ROUTERS = {
+    "0x10ed43c718714eb63d5aa57b78b54704e256024e",  # PancakeSwap V2 Router
+    "0x1b81d678ffb9c0263b24a97847620c99d213eb14",  # PancakeSwap V3 SwapRouter
+    "0x13f4ea83d0bd40e75c8222255bc855a974568dd4",  # PancakeSwap SmartRouter
+    "0xb300000b72deaeb607a12d5f54773d1c19c7028d",  # PancakeSwap SmartRouter V2 (实际地址)
+    "0x46a15b0b27311cedf172ab29e4f4766fbe7f4364",  # PancakeSwap V3 NonfungiblePositionManager
+    "0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae",  # PancakeSwap V3 PositionManager (实际地址)
+    "0x111111125421c6f28a6c27c06ee7c2bc3c2713f6",  # 1inch Router
+    "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",  # PancakeSwap V3 管理/路由合约
+    "0x2480faeb931272cd1f7375d8f4c104a4db5fff63",  # PancakeSwap 路由合约
+    "0x00000000214b106a4d67113a969ab6e7a56cfb0d",  # DEX 聚合器
+}
+
 DEFAULT_RPCS = [
     "https://bsc-rpc.publicnode.com",
     "https://bsc.drpc.org",

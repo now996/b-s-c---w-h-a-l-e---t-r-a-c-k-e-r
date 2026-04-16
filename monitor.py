@@ -12,7 +12,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 # 统一数据源层 — 消除重复代码
-from data_source import RPCClient, PriceProvider, get_rpc_client, get_price_provider
+from data_source import RPCClient, PriceProvider, get_rpc_client, get_price_provider, DEX_ROUTERS
 
 SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -746,8 +746,10 @@ def run_monitor(config, notify_fn):
                     usd = amount * token_price if price_available else None
                     block = int(log["blockNumber"], 16)
 
-                    is_buy = from_addr.lower() in pair_set
-                    is_sell = to_addr.lower() in pair_set
+                    # 买卖判断：从 LP/路由器转入=买入，转给 LP/路由器=卖出
+                    _dex_addrs = pair_set | {r.lower() for r in DEX_ROUTERS}
+                    is_buy = from_addr.lower() in _dex_addrs
+                    is_sell = to_addr.lower() in _dex_addrs
                     is_whale_from = from_addr.lower() in whale_set
                     is_whale_to = to_addr.lower() in whale_set
                     is_watch_from = from_addr.lower() in watched_set
