@@ -20,7 +20,9 @@ import os
 # Telegram 状态追踪
 _telegram_fail_count = 0
 _telegram_last_fail_time = 0
-_telegram_permanently_disabled = False  # 403 (Bot被拉黑) 后永久禁用
+_telegram_permanently_disabled = False  # 403 (Bot被拉黑) 后禁用
+_telegram_disabled_since = 0             # 禁用时间戳
+_TELEGRAM_RETRY_INTERVAL = 3600          # 每小时重试一次（用户可能重新启用 Bot）
 _TELEGRAM_MAX_CONTINUOUS_FAILS = 10     # 连续失败 10 次后进入静默模式
 _TELEGRAM_SILENT_DURATION = 300         # 静默模式持续 5 分钟
 
@@ -29,9 +31,12 @@ def send_telegram(token, chat_id, message, retries=3):
     """发送 Telegram 消息，修复 403 无限重试问题"""
     global _telegram_fail_count, _telegram_last_fail_time, _telegram_permanently_disabled
 
-    # 永久禁用检查：403 (Bot被拉黑) 后不再尝试
+    # 永久禁用检查：403 后不再尝试，但每小时重试一次（用户可能重新启用 Bot）
     if _telegram_permanently_disabled:
-        return False
+        if _telegram_disabled_since and time.time() - _telegram_disabled_since > _TELEGRAM_RETRY_INTERVAL:
+            _telegram_permanently_disabled = False  # 重置，允许重试
+        else:
+            return False
 
     # 静默模式检查：连续失败过多时，暂停发送
     if _telegram_fail_count >= _TELEGRAM_MAX_CONTINUOUS_FAILS:
@@ -79,6 +84,7 @@ def _send_telegram_single(token, chat_id, message, retries=3):
             if r.status_code == 403:
                 if not _telegram_permanently_disabled:
                     _telegram_permanently_disabled = True
+                    _telegram_disabled_since = time.time()
                     print(f"[notify] Telegram 403: Bot 被拉黑或无权限，永久禁用 Telegram 通道", file=sys.stderr)
                 return False
 
@@ -136,29 +142,35 @@ def send_webhook(url, message, webhook_type="dingtalk", retries=2):
 
     for attempt in range(retries):
         try:
+            # 转为纯文本用于 Webhook（去掉 HTML 标签）
+            plain_msg = _strip_html_tags(message) if "<" in message else message
+
             if webhook_type == "dingtalk":
-                # 钉钉机器人 Webhook
+                # 钉钉机器人 Webhook（Markdown 格式）
                 payload = {
-                    "msgtype": "text",
-                    "text": {"content": message}
+                    "msgtype": "markdown",
+                    "markdown": {"title": "BSC鲸鱼追踪", "text": plain_msg}
                 }
             elif webhook_type == "feishu":
-                # 飞书机器人 Webhook
+                # 飞书机器人 Webhook（富文本格式）
                 payload = {
-                    "msg_type": "text",
-                    "content": {"text": message}
+                    "msg_type": "interactive",
+                    "card": {
+                        "elements": [{"tag": "markdown", "content": plain_msg}],
+                        "header": {"title": {"tag": "plain_text", "content": "BSC鲸鱼追踪"}}
+                    }
                 }
             elif webhook_type == "wecom":
-                # 企业微信 Webhook
+                # 企业微信 Webhook（Markdown 格式）
                 payload = {
-                    "msgtype": "text",
-                    "text": {"content": message}
+                    "msgtype": "markdown",
+                    "markdown": {"content": plain_msg}
                 }
             elif webhook_type == "custom":
                 # 自定义 Webhook（JSON POST）
-                payload = {"message": message}
+                payload = {"message": plain_msg}
             else:
-                payload = {"message": message}
+                payload = {"message": plain_msg}
 
             r = requests.post(url, json=payload, timeout=10)
             if r.status_code == 200:
@@ -179,8 +191,9 @@ def create_notifier(config):
     """创建统一通知函数，支持 Telegram + Webhook 多通道"""
     token = config.get("telegram_bot_token", "")
     chat_id = config.get("telegram_chat_id", "")
-    webhook_url = config.get("notify", {}).get("webhook_url", "") if isinstance(config.get("notify"), dict) else ""
-    webhook_type = config.get("notify", {}).get("webhook_type", "dingtalk") if isinstance(config.get("notify"), dict) else "dingtalk"
+    notify_cfg = config.get("notify") or {}
+    webhook_url = notify_cfg.get("webhook_url", "")
+    webhook_type = notify_cfg.get("webhook_type", "dingtalk")
 
     def notify(msg):
         results = []

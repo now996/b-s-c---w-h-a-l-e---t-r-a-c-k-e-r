@@ -71,11 +71,8 @@ async def _ws_subscribe(wss_url, contracts, on_log, on_disconnect, stop_event):
                     await asyncio.sleep(5)
                     continue
                 print(f"[ws] 订阅成功 (id={sub_id}), 监控 {len(contracts)} 个合约", file=sys.stderr)
-                # 通知连接已恢复
-                on_log({"_ws_connected": True, "blockNumber": "0x0", "_reconnected": True})
-
-                # 发送 connected 信号（用特殊的 log）
-                on_log({"_ws_connected": True, "blockNumber": "0x0"})
+                # 通知连接已恢复，携带最后区块号供主循环补查
+                on_log({"_ws_connected": True, "blockNumber": "0x0", "_reconnected": True, "_last_ws_block": last_block})
 
                 # 持续接收 logs
                 while not stop_event.is_set():

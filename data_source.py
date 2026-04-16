@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import time
+import threading
 import requests
 from datetime import datetime, timezone
 
@@ -21,7 +22,6 @@ WBNB = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 DEFAULT_RPCS = [
     "https://bsc-rpc.publicnode.com",
     "https://bsc.drpc.org",
-    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
     "https://rpc.ankr.com/bsc",
     "https://bsc.meowrpc.com",
     "https://1rpc.io/bnb",
@@ -214,15 +214,25 @@ class DexScreenerClient:
         查询代币价格和 DEX 数据
         返回: (price_usd, dex_data_dict)
         """
-        try:
-            url = f"{self.BASE_URL}/latest/dex/tokens/{contract}"
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            pairs = r.json().get("pairs", [])
-            if pairs:
-                return float(pairs[0].get("priceUsd") or 0), pairs[0]
-        except Exception as e:
-            print(f"[dexscreener] 查询失败: {e}", file=sys.stderr)
+        for retry in range(3):
+            try:
+                url = f"{self.BASE_URL}/latest/dex/tokens/{contract}"
+                r = requests.get(url, timeout=10)
+                if r.status_code == 429:
+                    wait = min(2 ** retry, 10)
+                    print(f"[dexscreener] 429 限速，等待 {wait}s", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                pairs = r.json().get("pairs", [])
+                if pairs:
+                    return float(pairs[0].get("priceUsd") or 0), pairs[0]
+                break  # 无数据，不重试
+            except Exception as e:
+                if retry < 2:
+                    time.sleep(2 ** retry)
+                else:
+                    print(f"[dexscreener] 查询失败: {e}", file=sys.stderr)
         return 0, {}
 
     def get_pair_info(self, pair_addr):
@@ -277,15 +287,25 @@ class GeckoTerminalClient:
 # ═══════════════════════════════════════════
 
 class RPCClient:
-    """统一公共 RPC 调用，带轮询重试和负载均衡"""
+    """统一公共 RPC 调用，带轮询重试、粘性 RPC 和线程安全"""
 
     def __init__(self, rpcs=None):
         self.rpcs = rpcs or _get_rpc_candidates()
+        self._sticky_idx = 0  # 粘性 RPC：记住上次成功的索引
+        self._lock = __import__('threading').Lock()
 
     def call(self, method, params, timeout=10):
-        """通用 RPC 调用，轮询所有 RPC 直到成功"""
-        last_error = None
-        for rpc in self.rpcs:
+        """通用 RPC 调用，优先使用上次成功的 RPC（粘性），失败后轮询"""
+        last_errors = []
+        # 先尝试粘性 RPC
+        order = list(range(len(self.rpcs)))
+        if self._sticky_idx < len(order):
+            order.insert(0, order.pop(self._sticky_idx))
+
+        for idx in order:
+            rpc = self.rpcs[idx] if idx < len(self.rpcs) else None
+            if not rpc:
+                continue
             try:
                 r = requests.post(rpc, json={
                     "jsonrpc": "2.0",
@@ -297,11 +317,14 @@ class RPCClient:
                 data = r.json()
                 if "error" in data:
                     raise RuntimeError(str(data["error"]))
+                # 更新粘性索引
+                with self._lock:
+                    self._sticky_idx = idx
                 return data.get("result"), rpc
             except Exception as e:
-                last_error = e
+                last_errors.append(f"{rpc}: {e}")
                 continue
-        raise RuntimeError(f"all rpc failed: {last_error}")
+        raise RuntimeError(f"all rpc failed: {'; '.join(last_errors[-3:])}")
 
     def eth_call(self, to, data):
         """调用合约的 view 函数"""
@@ -313,18 +336,11 @@ class RPCClient:
 
     def get_latest_block(self):
         """获取最新区块号"""
-        for rpc in self.rpcs:
-            try:
-                r = requests.post(rpc, json={
-                    "jsonrpc": "2.0",
-                    "method": "eth_blockNumber",
-                    "params": [],
-                    "id": 1
-                }, timeout=10)
-                return int(r.json().get("result", "0x0"), 16)
-            except Exception:
-                continue
-        return 0
+        try:
+            result, _ = self.call("eth_blockNumber", [], timeout=10)
+            return int(result, 16) if result else 0
+        except Exception:
+            return 0
 
     def get_logs(self, address, from_block, to_block, topic=None):
         """
@@ -385,6 +401,8 @@ class PriceProvider:
         self._rpc = RPCClient()
         self._bnb_price_cache = {"price": 0, "ts": 0}
         self._token_price_cache = {}  # contract -> {"price": x, "dex_data": {}, "ts": float}
+        self._config_cache = None  # 缓存 config 避免重复读文件
+        self._config_cache_ts = 0
 
     def get_bnb_price(self):
         """
@@ -413,7 +431,11 @@ class PriceProvider:
         except Exception:
             pass
 
-        # 降级: 硬编码
+        # 降级: 使用上次缓存的价格，否则 600
+        fallback = self._bnb_price_cache.get("price", 600)
+        if fallback > 0 and fallback != 600:
+            print(f"[price] BNB 价格获取失败，使用缓存值 {fallback}", file=sys.stderr)
+            return fallback
         return 600
 
     def get_token_price(self, contract):
@@ -436,8 +458,12 @@ class PriceProvider:
         except Exception:
             pass
 
-        # 源2: GeckoTerminal（需要 pair 地址，从 dex_data 或 config 获取）
-        config = _load_config()
+        # 源2: GeckoTerminal（需要 pair 地址，从缓存 config 获取）
+        now_cfg = time.time()
+        if self._config_cache is None or now_cfg - self._config_cache_ts > 60:
+            self._config_cache = _load_config()
+            self._config_cache_ts = now_cfg
+        config = self._config_cache
         contract_cfg = config.get("contracts", {}).get(contract.lower(), {})
         pair = contract_cfg.get("pair", "")
         if pair:
@@ -463,24 +489,31 @@ class PriceProvider:
 _alchemy_client = None
 _rpc_client = None
 _price_provider = None
+_singleton_lock = threading.Lock()
 
 
 def get_alchemy_client():
     global _alchemy_client
     if _alchemy_client is None:
-        _alchemy_client = AlchemyClient()
+        with _singleton_lock:
+            if _alchemy_client is None:
+                _alchemy_client = AlchemyClient()
     return _alchemy_client
 
 
 def get_rpc_client():
     global _rpc_client
     if _rpc_client is None:
-        _rpc_client = RPCClient()
+        with _singleton_lock:
+            if _rpc_client is None:
+                _rpc_client = RPCClient()
     return _rpc_client
 
 
 def get_price_provider():
     global _price_provider
     if _price_provider is None:
-        _price_provider = PriceProvider()
+        with _singleton_lock:
+            if _price_provider is None:
+                _price_provider = PriceProvider()
     return _price_provider

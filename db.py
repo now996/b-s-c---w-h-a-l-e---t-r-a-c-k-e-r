@@ -18,7 +18,7 @@ DATA_DIR = os.path.join(SCRIPT_DIR, "data")
 def get_db_path(contract):
     """获取合约对应的数据库路径"""
     contract = contract.lower()
-    return os.path.join(DATA_DIR, f"{contract[:10]}.db")
+    return os.path.join(DATA_DIR, f"{contract[:20]}.db")
 
 
 def get_connection(contract):
@@ -228,7 +228,7 @@ def get_db_stats(contract=None):
     stats = {}
     if contract:
         # 支持传入完整合约地址或前10位缩写
-        contract_key = contract.lower()[:10]
+        contract_key = contract.lower()[:20]
         contracts = [contract_key]
     else:
         # 扫描所有 db 文件

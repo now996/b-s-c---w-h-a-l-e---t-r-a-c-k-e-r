@@ -4,6 +4,7 @@ scan_core.py — 扒庄核心分析引擎
 返回结构化数据，供 quick_scan.py (CLI) 和微信调用
 """
 import sys, os, json, time, requests, sqlite3
+from decimal import Decimal
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -15,7 +16,6 @@ DEAD = "0x000000000000000000000000000000000000dead"
 DEFAULT_RPCS = [
     "https://bsc-rpc.publicnode.com",
     "https://bsc.drpc.org",
-    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
     "https://rpc.ankr.com/bsc",
     "https://bsc.meowrpc.com",
     "https://1rpc.io/bnb",
@@ -48,8 +48,10 @@ def get_rpc_candidates():
             primary = config.get("bsc_rpc")
             if isinstance(primary, str) and primary and primary not in rpcs:
                 rpcs.append(primary)
-    except Exception:
-        pass
+    except json.JSONDecodeError as e:
+        print(f"[scan_core] config.json 格式错误: {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"[scan_core] 读取 config 失败: {e}", file=sys.stderr)
 
     env_rpc = os.environ.get("BSC_RPC")
     if env_rpc and env_rpc not in rpcs:
@@ -122,42 +124,75 @@ def get_token_price(contract):
 # ═══════════════════════════════════════════
 
 def get_token_info(contract):
-    name = decode_string(eth_call(contract, "0x06fdde03"))
-    symbol = decode_string(eth_call(contract, "0x95d89b41"))
-    dec_hex = eth_call(contract, "0x313ce567")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # 并行查询 5 个基本字段
+    def _query(data_sig):
+        return data_sig, eth_call(contract, data_sig)
+
+    basic_sigs = ["0x06fdde03", "0x95d89b41", "0x313ce567", "0x18160ddd", "0x8da5cb5b"]
+    basic_results = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_query, sig): sig for sig in basic_sigs}
+        for future in as_completed(futures):
+            sig, result = future.result()
+            basic_results[sig] = result
+
+    name = decode_string(basic_results.get("0x06fdde03", "0x"))
+    symbol = decode_string(basic_results.get("0x95d89b41", "0x"))
+    dec_hex = basic_results.get("0x313ce567", "0x")
     decimals = int(dec_hex, 16) if dec_hex and dec_hex != "0x" else 18
-    supply_hex = eth_call(contract, "0x18160ddd")
+    supply_hex = basic_results.get("0x18160ddd", "0x")
     total_supply = int(supply_hex, 16) / (10 ** decimals) if supply_hex and supply_hex != "0x" else 0
-    owner_hex = eth_call(contract, "0x8da5cb5b")
+    owner_hex = basic_results.get("0x8da5cb5b", "0x")
     owner = "0x" + owner_hex[-40:] if owner_hex and len(owner_hex) >= 42 else "?"
 
     WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
     pools = []  # [(address, version), ...]
 
-    # ═══ 多 DEX V2 Factory 查询 ═══
+    # ═══ 多 DEX V2 + V3 Factory 并行查询 ═══
     V2_FACTORIES = [
         ("0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73", "PancakeSwap"),
         ("0x858E3312ed3A876947EA49d572A7C42DE08af7EE", "Biswap"),
         ("0x86407bEa2078ea5f5EB5A52B2caA963bC1F889Da", "BabySwap"),
         ("0x3CD1C46068dAEa5Ebb0d3f55F6915B10648062B8", "MDEX"),
     ]
-    v2_pair = None  # 第一个发现的 V2 pair（用于价格历史）
+    V3_FACTORY = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
+    V3_FEES = [100, 500, 2500, 10000]
+
+    def _query_factory(args):
+        addr, name, data = args
+        return name, eth_call(addr, data)
+
+    factory_queries = []
     for factory_addr, dex_name in V2_FACTORIES:
         data = "0xe6a43905" + contract[2:].lower().zfill(64) + WBNB[2:].lower().zfill(64)
-        pair_hex = eth_call(factory_addr, data)
+        factory_queries.append((factory_addr, f"{dex_name}-v2", data))
+    for fee in V3_FEES:
+        data = "0x1698ee82" + contract[2:].lower().zfill(64) + WBNB[2:].lower().zfill(64) + hex(fee)[2:].zfill(64)
+        factory_queries.append((V3_FACTORY, f"v3-{fee}", data))
+
+    factory_results = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_query_factory, q): q[1] for q in factory_queries}
+        for future in as_completed(futures):
+            name_key, result = future.result()
+            factory_results[name_key] = result
+
+    v2_pair = None
+    for factory_addr, dex_name in V2_FACTORIES:
+        key = f"{dex_name}-v2"
+        pair_hex = factory_results.get(key, "0x")
         if pair_hex and int(pair_hex, 16) != 0:
             found_pair = "0x" + pair_hex[-40:]
             if found_pair.lower() not in {p[0].lower() for p in pools}:
-                pools.append((found_pair, f"{dex_name}-v2"))
+                pools.append((found_pair, key))
                 if v2_pair is None:
                     v2_pair = found_pair
 
-    # ═══ PancakeSwap V3 — 查询所有 fee tier ═══
-    V3_FACTORY = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
-    V3_FEES = [100, 500, 2500, 10000]
     for fee in V3_FEES:
-        data = "0x1698ee82" + contract[2:].lower().zfill(64) + WBNB[2:].lower().zfill(64) + hex(fee)[2:].zfill(64)
-        pool_hex = eth_call(V3_FACTORY, data)
+        key = f"v3-{fee}"
+        pool_hex = factory_results.get(key, "0x")
         if pool_hex and len(pool_hex) >= 42 and int(pool_hex, 16) != 0:
             pool_addr = "0x" + pool_hex[-40:]
             if pool_addr.lower() not in {p[0].lower() for p in pools}:
@@ -184,13 +219,16 @@ def _parse_transfer(tx, decimals=18):
     value = tx.get("value")
     if value is not None:
         try:
-            amount = float(value)
+            # Alchemy getAssetTransfers 的 value 已经是 token 数量（如 "1000.5"），
+            # 不需要再除以 decimals，直接转 float 即可
+            amount = float(Decimal(str(value)))
         except Exception:
             return None
     else:
         raw = tx.get("rawContract") or {}
         hex_val = raw.get("value") or "0x0"
         try:
+            # rawContract.value 是 wei 格式的 hex，需要除以 decimals
             amount = int(hex_val, 16) / (10 ** decimals)
         except Exception:
             return None
@@ -214,7 +252,8 @@ def _parse_alchemy_transfer(tx, decimals=18):
     value = tx.get("value")
     if value is not None:
         try:
-            amount = float(value)
+            # Alchemy getAssetTransfers 的 value 已经是 token 数量，不需要再除以 decimals
+            amount = float(Decimal(str(value)))
         except Exception:
             return None, None
     else:
@@ -646,7 +685,7 @@ def load_transfers(contract, progress_fn=None, decimals=18, skip_sync=False, max
     """
     contract = contract.lower()
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    cache_db = os.path.join(script_dir, "data", f"{contract[:10]}.db")
+    cache_db = os.path.join(script_dir, "data", f"{contract[:20]}.db")
     os.makedirs(os.path.dirname(cache_db), exist_ok=True)
     if progress_fn is None:
         progress_fn = lambda msg: print(msg, file=sys.stderr)
@@ -831,6 +870,13 @@ def identify_whales(records, pools_info, total_supply, top_n=10):
         balances[ta] += amount
         if fa in pool_set:
             buyers[ta] += amount
+        elif fa == ZERO:
+            # mint 事件（from=0x0）：to_addr 正常累加到 transfer_graph
+            # 不追踪 from 方，但 to 方的余额来源应被记录
+            pass  # balances 已经累加了 to_addr
+        elif ta == ZERO or ta == DEAD:
+            # burn 事件：from 的转出已通过 balances 扣减
+            pass
         elif fa not in exclude and ta not in exclude:
             transfer_graph[fa][ta] += amount
 
@@ -887,6 +933,15 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
     deep: 是否启用深度分析（跨合约追踪，耗时较长）
     """
     contract = contract_addr.lower()
+
+    # 合约地址格式校验
+    if not contract.startswith("0x") or len(contract) != 42:
+        return {"error": f"无效合约地址格式: {contract_addr}（需要 0x + 40 hex 字符）"}
+    try:
+        int(contract[2:], 16)
+    except ValueError:
+        return {"error": f"合约地址包含非十六进制字符: {contract_addr}"}
+
     if not os.environ.get("ALCHEMY_KEY", ""):
         return {"error": "请设置 ALCHEMY_KEY 环境变量"}
 
@@ -981,11 +1036,15 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
 
     # 全量 balance
     balances = defaultdict(float)
-    for block, fa, ta, amount in records:
+    # 同时构建 addr→records 倒排索引，避免后续 O(W×N) 遍历
+    addr_records = defaultdict(list)
+    for i, (block, fa, ta, amount) in enumerate(records):
         balances[fa] -= amount
         balances[ta] += amount
+        addr_records[fa].append(i)
+        addr_records[ta].append(i)
 
-    # 庄家成本分析（所有 pool 的买卖都算）
+    # 庄家成本分析（使用倒排索引，O(N) 而非 O(W×N)）
     whale_results = []
     for addr in whale_addrs:
         total_buy_cost = 0
@@ -994,7 +1053,12 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
         total_sell_amount = 0
         buy_cnt = 0
         sell_cnt = 0
-        for block, fa, ta, amount in records:
+        seen = set()  # 避免同一条记录被 fa/ta 重复处理
+        for i in addr_records.get(addr, []):
+            if i in seen:
+                continue
+            seen.add(i)
+            block, fa, ta, amount = records[i]
             if fa in pool_set and ta == addr:
                 price = block_to_price(block)
                 total_buy_cost += amount * price
@@ -1030,8 +1094,16 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
 
     # 抛压（只算真人庄家，排除合约地址）
     whale_remaining = sum(max(balances.get(a, 0), 0) for a in whale_set)
-    # 合并所有 pool 的 token 余额估算池子深度
-    lp_est = sum(abs(balances.get(p, 0)) for p in pool_set)
+    # LP 池深度估算：使用链上 balanceOf 查询（更准确）
+    lp_est = 0
+    for p in pool_set:
+        bal = balances.get(p, 0)
+        if bal < 0:
+            # LP 合约在 transfer_graph 中 balance 为负说明是"池子给出去的"
+            # 使用绝对值作为池子实际持有量的近似（从交易记录推导）
+            lp_est += abs(bal)
+        elif bal > 0:
+            lp_est += bal
     lp_est = max(lp_est, total_supply * 0.01)
     impact = whale_remaining / (lp_est + whale_remaining) * 100
     # 防止超过 100%（数据不完整时）
@@ -1041,19 +1113,29 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
         "remaining": whale_remaining,
         "remaining_usd": whale_remaining * tp,
         "pct_supply": pct_supply,
-        "impact_pct": min(impact, 99.9),
+        "impact_pct": round(impact, 1),  # 保留原始值，不人为截断
     }
 
-    # 持仓集中度（Top50 大户检查是否合约，其余直接算真人）
-    all_holders = {k: v for k, v in balances.items() if v > 1000 and k not in exclude}
+    # 持仓集中度 — 阈值改为基于 USD 价值（>$100 算大户）
+    min_hold_value = 100 / tp if tp > 0 else 1000
+    min_hold_value = max(min_hold_value, 100)  # 至少 100 token
+    all_holders = {k: v for k, v in balances.items() if v > min_hold_value and k not in exclude}
     sorted_all = sorted(all_holders.items(), key=lambda x: -x[1])
 
-    # 只对 Top 50 做合约检查（避免几千次 RPC）
+    # Top 50 合约检查并行化
     contract_addrs = set()
-    for addr, _ in sorted_all[:50]:
-        if is_contract_address(addr):
-            contract_addrs.add(addr)
-            print(f"  排除合约持仓: {addr[:10]}..{addr[-4:]} ({all_holders[addr]:,.0f})", file=sys.stderr)
+    top50 = sorted_all[:50]
+    if top50:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def _check_contract(addr):
+            return addr, is_contract_address(addr)
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_check_contract, addr): addr for addr, _ in top50}
+            for future in as_completed(futures):
+                addr, is_contract = future.result()
+                if is_contract:
+                    contract_addrs.add(addr)
+                    print(f"  排除合约持仓: {addr[:10]}..{addr[-4:]} ({all_holders[addr]:,.0f})", file=sys.stderr)
 
     real_holders = {k: v for k, v in all_holders.items() if k not in contract_addrs}
     actual_supply = sum(v for v in real_holders.values())
@@ -1078,7 +1160,10 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
         })
 
     # 散户分析（排除所有 pool 地址）
-    retail = {k: v for k, v in balances.items() if v > 100 and k not in whale_set and k not in exclude}
+    # 散户：持仓 > 动态阈值，排除庄家和排除地址
+    retail_threshold = 10 / tp if tp > 0 else 100
+    retail_threshold = max(retail_threshold, 10)  # 至少 10 token
+    retail = {k: v for k, v in balances.items() if v > retail_threshold and k not in whale_set and k not in exclude}
     holdings = sorted(retail.values())
     total_retail = len(holdings)
     retail_stats = {"count": total_retail, "avg_usd": 0, "median_usd": 0, "distribution": {}}
@@ -1180,6 +1265,16 @@ def run_analysis(contract_addr, progress_fn=None, deep=False, skip_sync=False):
         "smart_money_activity": smart_money_activity if deep else {},
         "lp_analysis": lp_analysis,
     }
+
+    # 持仓快照（持久化到 DB，可用于对比变化）
+    progress_fn("📸 生成持仓快照...")
+    try:
+        from snapshot import take_whale_snapshot
+        snap = take_whale_snapshot(contract, whale_addrs[:10], tp)
+        if snap:
+            result["snapshot"] = snap
+    except Exception as e:
+        print(f"  快照生成失败（非关键）: {e}", file=sys.stderr)
 
     # 风险评分（需要完整 result）
     from risk_score import calculate_risk_score

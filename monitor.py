@@ -8,7 +8,7 @@ import time
 import json
 import os
 import sqlite3
-import requests
+
 from datetime import datetime, timedelta
 
 # 统一数据源层 — 消除重复代码
@@ -22,7 +22,6 @@ MONITOR_STATE_FILE = os.path.join(LOG_DIR, "monitor_state.json")
 DEFAULT_RPCS = [
     "https://bsc-rpc.publicnode.com",
     "https://bsc.drpc.org",
-    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
     "https://rpc.ankr.com/bsc",
     "https://bsc.meowrpc.com",
     "https://1rpc.io/bnb",
@@ -604,9 +603,12 @@ def run_monitor(config, notify_fn):
                     new_bnb = get_native_balance(rpcs, addr)
                     new_nonce = get_nonce(rpcs, addr)
 
-                    if state.get("bnb_balance", 0) <= 0 and new_bnb > 0 and not state.get("gas_alerted"):
+                    # Gas 告警：检测余额增量超过阈值（如 0.01 BNB）
+                    bnb_increase = new_bnb - state.get("bnb_balance", 0)
+                    gas_threshold = 0.01  # BNB
+                    if bnb_increase >= gas_threshold and not state.get("gas_alerted"):
                         state["stage"] = update_wallet_stage(state, had_gas=True)
-                        state["last_action"] = "收到 Gas"
+                        state["last_action"] = f"收到 Gas (+{bnb_increase:.4f} BNB)"
                         state["last_update"] = now
                         msg = format_watch_gas_alert(name, label, addr, new_bnb)
                         notify_all(msg)
@@ -616,22 +618,25 @@ def run_monitor(config, notify_fn):
                             "addr": addr,
                             "label": label,
                             "bnb_balance": new_bnb,
+                            "bnb_increase": round(bnb_increase, 6),
                             "stage": state["stage"],
                         })
                         state["gas_alerted"] = True
 
-                    if state.get("nonce", 0) == 0 and new_nonce > 0 and not state.get("nonce_alerted"):
+                    # Nonce 告警：检测任何 nonce 增长（地址激活）
+                    old_nonce = state.get("nonce", 0)
+                    if new_nonce > old_nonce:
                         state["stage"] = update_wallet_stage(state, had_nonce=True)
-                        state["last_action"] = "首次主动发交易"
+                        state["last_action"] = f"发交易 (nonce {old_nonce}->{new_nonce})"
                         state["last_update"] = now
-                        msg = format_watch_nonce_alert(name, label, addr, state.get("nonce", 0), new_nonce)
+                        msg = format_watch_nonce_alert(name, label, addr, old_nonce, new_nonce)
                         notify_all(msg)
                         log_event({
                             "contract": name,
                             "type": "watch_nonce",
                             "addr": addr,
                             "label": label,
-                            "old_nonce": state.get("nonce", 0),
+                            "old_nonce": old_nonce,
                             "new_nonce": new_nonce,
                             "stage": state["stage"],
                         })
@@ -679,6 +684,11 @@ def run_monitor(config, notify_fn):
             if catchup_mode:
                 print(f"[monitor] catch-up | backlog={backlog} | chunk={chunk_size} | {last_block + 1}->{scan_to}", file=sys.stderr)
 
+            # WSS 模式：在合约循环外一次性取所有 logs，避免 drain_logs 只在第一个合约生效
+            all_ws_logs = []
+            if ws_mon and ws_mon.connected and not ws_mon.should_fallback_to_poll():
+                all_ws_logs = ws_mon.drain_logs()
+
             for contract, cfg in contracts.items():
                 name = cfg["name"]
                 # 构建所有 pair 地址集合（多 DEX 支持）
@@ -704,17 +714,14 @@ def run_monitor(config, notify_fn):
 
                 token_decimals = get_token_decimals(contract, rpcs)
 
-                # WSS 模式：优先从 WebSocket 队列取 logs
+                # WSS 模式：从预取的 logs 中按合约地址过滤
                 ws_logs = []
-                if ws_mon and ws_mon.connected and not ws_mon.should_fallback_to_poll():
-                    all_ws_logs = ws_mon.drain_logs()
-                    # 过滤出当前合约的 logs
-                    for wl in all_ws_logs:
-                        log_addr = (wl.get("address") or "").lower()
-                        if log_addr == contract.lower():
-                            log_block = int(wl.get("blockNumber", "0x0"), 16)
-                            if last_block < log_block <= scan_to:
-                                ws_logs.append(wl)
+                for wl in all_ws_logs:
+                    log_addr = (wl.get("address") or "").lower()
+                    if log_addr == contract.lower():
+                        log_block = int(wl.get("blockNumber", "0x0"), 16)
+                        if last_block < log_block <= scan_to:
+                            ws_logs.append(wl)
 
                 if ws_logs:
                     logs = ws_logs
@@ -810,30 +817,31 @@ def run_monitor(config, notify_fn):
                     else:
                         log_event(event)
 
-                # LP 储备变化监控（所有 pairs）
-                for pi in pairs_list:
-                    p = (pi["pair"] if isinstance(pi, dict) else pi).lower()
-                    dex_label = pi.get("dex", "") if isinstance(pi, dict) else ""
-                    new_reserves = get_reserves(p, rpcs, token_decimals)
-                    old_reserves = lp_state.get(p, (0, 0))
+                # LP 储备变化监控 — 仅在当前区间有事件时才查询（节省 RPC）
+                if logs:  # 当前区间有事件才查 LP
+                    for pi in pairs_list:
+                        p = (pi["pair"] if isinstance(pi, dict) else pi).lower()
+                        dex_label = pi.get("dex", "") if isinstance(pi, dict) else ""
+                        new_reserves = get_reserves(p, rpcs, token_decimals)
+                        old_reserves = lp_state.get(p, (0, 0))
 
-                    if old_reserves[0] > 0 and new_reserves[0] > 0:
-                        bnb_change_pct = abs(new_reserves[0] - old_reserves[0]) / old_reserves[0] * 100
-                        if bnb_change_pct > 5:
-                            lp_name = f"{name}[{dex_label}]" if dex_label else name
-                            msg = format_lp_change(lp_name, old_reserves[0], new_reserves[0], old_reserves[1], new_reserves[1], bnb_price)
-                            notify_all(msg)
-                            log_event({
-                                "contract": name,
-                                "type": "lp_change",
-                                "dex": dex_label,
-                                "pair": p,
-                                "old_bnb": old_reserves[0],
-                                "new_bnb": new_reserves[0],
-                                "change_pct": bnb_change_pct,
-                            })
+                        if old_reserves[0] > 0 and new_reserves[0] > 0:
+                            bnb_change_pct = abs(new_reserves[0] - old_reserves[0]) / old_reserves[0] * 100
+                            if bnb_change_pct > 5:
+                                lp_name = f"{name}[{dex_label}]" if dex_label else name
+                                msg = format_lp_change(lp_name, old_reserves[0], new_reserves[0], old_reserves[1], new_reserves[1], bnb_price)
+                                notify_all(msg)
+                                log_event({
+                                    "contract": name,
+                                    "type": "lp_change",
+                                    "dex": dex_label,
+                                    "pair": p,
+                                    "old_bnb": old_reserves[0],
+                                    "new_bnb": new_reserves[0],
+                                    "change_pct": bnb_change_pct,
+                                })
 
-                    lp_state[p] = new_reserves
+                        lp_state[p] = new_reserves
 
                 last_check = _last_alert_check.get(contract, 0)
                 if price_available and time.time() - last_check > 300:

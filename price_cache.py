@@ -14,7 +14,6 @@ DB_PATH = os.path.join(SCRIPT_DIR, "data", "price_cache.db")
 DEFAULT_RPCS = [
     "https://bsc-rpc.publicnode.com",
     "https://bsc.drpc.org",
-    "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
     "https://rpc.ankr.com/bsc",
     "https://bsc.meowrpc.com",
     "https://1rpc.io/bnb",

@@ -159,7 +159,43 @@ def calculate_risk_score(result):
         reason = f"池子${liq:,.0f} 深厚"
     breakdown.append({"name": "流动性", "score": s, "max": 10, "reason": reason})
 
-    # ═══ 8. 跨合约前科 (0-10, 仅 deep 模式) ═══
+    # ═══ 8. LP 安全 (0-10) ═══
+    lp_analysis = result.get("lp_analysis", {})
+    if lp_analysis:
+        lp_risk = lp_analysis.get("risk_level", "low")
+        provider_count = lp_analysis.get("provider_count", 0)
+        remove_pct = lp_analysis.get("remove_pct", 0)
+        is_locked = lp_analysis.get("is_locked", False)
+        is_burned = lp_analysis.get("is_burned", False)
+
+        s = 0
+        reasons = []
+        # LP 提供者数量
+        if provider_count <= 1:
+            s += 5
+            reasons.append("单LP提供者")
+        elif provider_count <= 2:
+            s += 3
+            reasons.append(f"仅{provider_count}个LP")
+        # 撤池比例
+        if remove_pct > 50:
+            s += 4
+            reasons.append(f"已撤{remove_pct:.0f}%")
+        elif remove_pct > 20:
+            s += 2
+            reasons.append(f"撤{remove_pct:.0f}%")
+        # LP 锁定/销毁（正面信号，降分）
+        if is_locked or is_burned:
+            s = max(s - 3, 0)
+            reasons.append("LP已锁定" if is_locked else "LP已销毁")
+
+        s = min(s, 10)
+        reason = " | ".join(reasons) if reasons else "LP安全"
+        breakdown.append({"name": "LP安全", "score": s, "max": 10, "reason": reason})
+    else:
+        breakdown.append({"name": "LP安全", "score": 5, "max": 10, "reason": "未检测"})
+
+    # ═══ 9. 跨合约前科 (0-10, 仅 deep 模式) ═══
     cross_track = result.get("cross_track", {})
     if cross_track:
         criminals = sum(1 for d in cross_track.values() if "惯犯" in d.get("pattern", ""))

@@ -97,6 +97,94 @@ def print_full_report(result):
     for risk in result["risks"]:
         print(f"  ⚠️ {risk}")
 
+    # 风险评分
+    rs = result.get("risk_score")
+    if rs:
+        print(f"\n{rs['emoji']} 综合风险评分: {rs['score']}/100 [{rs['level']}]")
+        print("-" * 40)
+        for b in rs["breakdown"]:
+            bar_len = 8
+            filled = int(b["score"] / b["max"] * bar_len) if b["max"] > 0 else 0
+            bar = "█" * filled + "░" * (bar_len - filled)
+            print(f"  {b['name']}: {bar} {b['score']}/{b['max']} {b['reason']}")
+
+    # 分仓检测
+    shard = result.get("shard_results", {})
+    if shard:
+        print(f"\n🔍 分仓检测")
+        print("-" * 40)
+        for addr, d in shard.items():
+            short = f"{addr[:10]}..{addr[-4:]}"
+            print(f"  {short}: {d.get('pattern', '?')} | 分仓{d.get('shard_count', 0)}个 | 卖出${d.get('total_shard_sold', 0)*tp:,.0f}")
+
+    # 聚类分析
+    clusters = result.get("clusters", [])
+    if clusters:
+        print(f"\n🔗 庄家团伙")
+        print("-" * 40)
+        for i, c in enumerate(clusters[:5]):
+            print(f"  团伙{i+1}: {c['size']}个地址 | 关联资金${c.get('total_value', 0):,.0f}")
+
+    # 地址标签
+    labels = result.get("whale_labels", {})
+    if labels:
+        print(f"\n🏷️ 地址标签")
+        print("-" * 40)
+        for addr, label in labels.items():
+            short = f"{addr[:10]}..{addr[-4:]}"
+            print(f"  {short}: {label}")
+
+    # LP 安全
+    lp = result.get("lp_analysis", {})
+    if lp:
+        print(f"\n🏊 LP 安全分析")
+        print("-" * 40)
+        print(f"  风险等级: {lp.get('risk_level', '?')}")
+        print(f"  LP提供者: {lp.get('provider_count', '?')}个")
+        print(f"  已撤比例: {lp.get('remove_pct', 0):.1f}%")
+        if lp.get("is_locked"):
+            print(f"  ✅ LP已锁定")
+        if lp.get("is_burned"):
+            print(f"  ✅ LP已销毁")
+        for p in lp.get("patterns", []):
+            print(f"  {p}")
+
+    # 跨合约追踪
+    ct = result.get("cross_track", {})
+    if ct:
+        print(f"\n🌐 跨合约追踪")
+        print("-" * 40)
+        for addr, d in ct.items():
+            short = f"{addr[:10]}..{addr[-4:]}"
+            print(f"  {short}: 参与{d.get('token_count', 0)}个token | {d.get('pattern', '?')}")
+
+    # 资金溯源
+    ft = result.get("fund_trace", {})
+    if ft:
+        print(f"\n💸 资金溯源")
+        print("-" * 40)
+        for addr, d in ft.items():
+            short = f"{addr[:10]}..{addr[-4:]}"
+            src = d.get("first_source", "?")
+            print(f"  {short}: 来源 {src} | {d.get('pattern', '?')}")
+
+    # 聪明钱
+    sm = result.get("smart_money", [])
+    if sm:
+        print(f"\n🧠 聪明钱")
+        print("-" * 40)
+        for s in sm[:5]:
+            short = f"{s['addr'][:10]}..{s['addr'][-4:]}"
+            print(f"  {short}: 得分{s.get('score', 0)} | {s.get('reason', '?')}")
+
+    # 快照
+    snap = result.get("snapshot")
+    if snap:
+        print(f"\n📸 持仓快照")
+        print("-" * 40)
+        from snapshot import format_snapshot
+        print(format_snapshot(snap))
+
     print(f"\n{'='*60}")
     print(f"分析完成 | {result['total_records']:,} 笔转账 | {result['total_holders']} 持仓地址 | {len(result['whale_addrs'])} 庄家")
     print(f"{'='*60}")
